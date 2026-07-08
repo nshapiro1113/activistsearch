@@ -12,13 +12,14 @@ closer look -> generate a full playbook/report for just those.
 from __future__ import annotations
 
 import os
+import statistics
 
 import pandas as pd
 import streamlit as st
 
 from scorer import CapitalIQClient, MockCapitalIQClient, score_company
 from playbook import generate_playbook
-from run_screen import build_peer_groups
+from run_screen import augment_peers_via_web_search, build_peer_groups
 
 st.set_page_config(page_title="Activist Candidate Screener", layout="wide")
 
@@ -117,9 +118,15 @@ if st.button("Score candidates", type="primary"):
 
         peer_groups = build_peer_groups(financials_by_ticker)
 
+        with st.spinner("Checking peer coverage (searching the web for direct competitors where needed)..."):
+            augment_peers_via_web_search(financials_by_ticker, peer_groups, ciq_client, anthropic_client)
+
         scores = {}
         progress = st.progress(0.0, text="Scoring candidates...")
-        for i, (ticker, company) in enumerate(financials_by_ticker.items()):
+        for i, ticker in enumerate(tickers):
+            if ticker not in financials_by_ticker:
+                continue
+            company = financials_by_ticker[ticker]
             try:
                 scores[ticker] = score_company(
                     company, peer_groups[ticker],
@@ -128,7 +135,7 @@ if st.button("Score candidates", type="primary"):
                 )
             except Exception as exc:
                 st.warning(f"Failed to score {ticker}: {exc}")
-            progress.progress((i + 1) / len(financials_by_ticker), text=f"Scored {ticker}")
+            progress.progress((i + 1) / len(tickers), text=f"Scored {ticker}")
 
         st.session_state.financials_by_ticker = financials_by_ticker
         st.session_state.peer_groups = peer_groups
@@ -164,9 +171,65 @@ if st.session_state.scores:
     for s in ranked:
         st.markdown(f"- **[{s.total:.1f}] {s.ticker}** — {s.thesis}")
 
-    with st.expander("Factor rationale (why each score is what it is)"):
-        for s in ranked:
-            st.markdown(f"**{s.ticker} — {s.name}**")
+    def _peer_median(peers, attr):
+        vals = [getattr(p, attr) for p in peers if getattr(p, attr) is not None]
+        return statistics.median(vals) if vals else None
+
+    def _pct(value):
+        return f"{value * 100:.1f}%" if value is not None else "n/a"
+
+    st.markdown("### Opportunity detail (for each candidate)")
+    for s in ranked:
+        company = st.session_state.financials_by_ticker.get(s.ticker)
+        peers = st.session_state.peer_groups.get(s.ticker, [])
+        band_label, posture = s.band
+
+        with st.expander(f"{s.ticker} — {s.name}  ·  {s.total:.1f}/100  ·  {band_label}"):
+            header_cols = st.columns([1, 5])
+            with header_cols[0]:
+                if s.logo_url:
+                    st.image(s.logo_url, width=64)
+            with header_cols[1]:
+                st.markdown(f"**{s.thesis}**")
+                st.caption(posture)
+
+            if company is not None:
+                peer_tsr_1yr = _peer_median(peers, "total_return_1yr")
+                peer_tsr_3yr = _peer_median(peers, "total_return_3yr")
+                rel_1yr = (company.total_return_1yr - peer_tsr_1yr
+                           if company.total_return_1yr is not None and peer_tsr_1yr is not None else None)
+                rel_3yr = (company.total_return_3yr - peer_tsr_3yr
+                           if company.total_return_3yr is not None and peer_tsr_3yr is not None else None)
+                metric_cols = st.columns(5)
+                metric_cols[0].metric("EBITDA margin", _pct(company.ebitda_margin))
+                metric_cols[1].metric("Net cash / mkt cap", _pct(company.net_cash_ratio))
+                metric_cols[2].metric("ROIC - cost of capital", _pct(company.roic_spread))
+                metric_cols[3].metric("TSR 1yr (abs / vs. peers)", f"{_pct(company.total_return_1yr)}", _pct(rel_1yr))
+                metric_cols[4].metric("TSR 3yr (abs / vs. peers)", f"{_pct(company.total_return_3yr)}", _pct(rel_3yr))
+                st.caption(f"Peer group: {', '.join(p.ticker for p in peers) or 'none identified'}")
+
+            gp = s.growth_potential
+            if gp is not None:
+                st.markdown("**Room for growth (computed directly from financials)**")
+
+                def _money(v):
+                    return f"${v:,.0f}" if v is not None else "n/a"
+
+                growth_cols = st.columns(4)
+                growth_cols[0].metric("Implied EBITDA uplift", _money(gp.implied_ebitda_uplift))
+                growth_cols[1].metric("Implied EV upside", _pct(gp.implied_ev_upside_pct))
+                growth_cols[2].metric("Implied economic-profit uplift", _money(gp.implied_economic_profit_uplift))
+                growth_cols[3].metric("Balance-sheet capacity", _money(gp.balance_sheet_capacity))
+                st.caption(gp.rationale)
+
+            if s.business_overview:
+                st.markdown("**Company overview**")
+                st.write(s.business_overview)
+            if s.management_assessment:
+                st.markdown("**Management assessment**")
+                st.write(s.management_assessment)
+
+            st.markdown("**Factor scores**")
             for label, factor in [
                 ("Factor 1 (Performance Gap)", s.factor1),
                 ("Factor 2 (Credible Fix)", s.factor2),
@@ -175,12 +238,19 @@ if st.session_state.scores:
                 ("Factor 5 (Structural Feasibility)", s.factor5),
             ]:
                 st.markdown(f"- *{label}* ({factor.score:.1f}/{factor.max_score:.0f}): {factor.rationale}")
+
             notes = s.qualitative_notes
             if notes.get("named_operator_or_asset"):
                 st.markdown(f"- *Named operator/asset:* {notes['named_operator_or_asset']}")
+            if notes.get("catalyst_evidence"):
+                st.markdown(f"- *Catalyst evidence:* {notes['catalyst_evidence']}")
             if notes.get("red_flags"):
                 st.markdown(f"- *Red flags:* {', '.join(notes['red_flags'])}")
-            st.divider()
+
+            if s.citations:
+                st.markdown("**Sources**")
+                for c in s.citations:
+                    st.markdown(f"- [{c.get('title', c.get('url'))}]({c.get('url')})")
 
     selected_tickers = edited.loc[edited["Investigate?"], "ticker"].tolist()
 

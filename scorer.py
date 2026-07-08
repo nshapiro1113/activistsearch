@@ -68,6 +68,7 @@ CIQ_MNEMONICS = {
     "enterprise_value": "IQ_TEV",
     "beta": "IQ_BETA",
     "interest_expense": "IQ_INT_EXPENSE",
+    "total_return_1yr": "IQ_TOTAL_RETURN_1YR",
     "total_return_3yr": "IQ_TOTAL_RETURN_3YR",
     "gics_sub_industry": "IQ_GICS_SUB_INDUSTRY",
     "gics_sub_industry_name": "IQ_GICS_SUB_INDUSTRY_NAME",
@@ -113,6 +114,7 @@ class CompanyFinancials:
     enterprise_value: Optional[float] = None
     beta: Optional[float] = None
     interest_expense: Optional[float] = None
+    total_return_1yr: Optional[float] = None
     total_return_3yr: Optional[float] = None
     gics_sub_industry: Optional[str] = None
     gics_sub_industry_name: Optional[str] = None
@@ -199,6 +201,11 @@ class ActivistScore:
     factor4: FactorScore
     factor5: FactorScore
     thesis: str = ""
+    business_overview: str = ""
+    management_assessment: str = ""
+    logo_url: Optional[str] = None
+    citations: list = field(default_factory=list)
+    growth_potential: Optional["GrowthPotential"] = None
     qualitative_notes: dict = field(default_factory=dict)
 
     @property
@@ -212,6 +219,7 @@ class ActivistScore:
 
     def as_row(self) -> dict:
         band_label, posture = self.band
+        gp = self.growth_potential
         return {
             "ticker": self.ticker,
             "name": self.name,
@@ -224,6 +232,10 @@ class ActivistScore:
             "total": round(self.total, 1),
             "band": band_label,
             "posture": posture,
+            "implied_ev_upside_pct": (round(gp.implied_ev_upside_pct * 100, 1)
+                                       if gp and gp.implied_ev_upside_pct is not None else None),
+            "implied_ebitda_uplift": (round(gp.implied_ebitda_uplift, 0)
+                                        if gp and gp.implied_ebitda_uplift is not None else None),
         }
 
 
@@ -315,6 +327,7 @@ class CapitalIQClient:
             enterprise_value=by_field["enterprise_value"],
             beta=by_field["beta"],
             interest_expense=by_field["interest_expense"],
+            total_return_1yr=by_field["total_return_1yr"],
             total_return_3yr=by_field["total_return_3yr"],
             gics_sub_industry=raw.get(CIQ_MNEMONICS["gics_sub_industry"]),
             gics_sub_industry_name=gics_name if isinstance(gics_name, str) else None,
@@ -361,6 +374,7 @@ class MockCapitalIQClient:
             enterprise_value=market_cap + total_debt - cash,
             beta=0.8 + (seed % 8) / 10.0,
             interest_expense=total_debt * 0.05,
+            total_return_1yr=-0.15 + (seed % 50) / 100.0,
             total_return_3yr=-0.1 + (seed % 40) / 100.0,
             gics_sub_industry=str(sub_industry_bucket),
             gics_sub_industry_name=f"Mock Sub-Industry {sub_industry_bucket}",
@@ -368,8 +382,38 @@ class MockCapitalIQClient:
 
 
 # ---------------------------------------------------------------------------
+# Presentation helpers
+# ---------------------------------------------------------------------------
+
+def fetch_logo_url(company_name: str) -> Optional[str]:
+    """Best-effort company logo via Clearbit's public, keyless autocomplete +
+    logo endpoints. Returns None on any failure -- this is cosmetic, not load
+    bearing, so it never raises."""
+    if not company_name:
+        return None
+    try:
+        resp = requests.get(
+            "https://autocomplete.clearbit.com/v1/companies/suggest",
+            params={"query": company_name},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if results and results[0].get("domain"):
+            return f"https://logo.clearbit.com/{results[0]['domain']}"
+    except (requests.RequestException, ValueError, IndexError, KeyError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Factor 1 - Quantifiable, Peer-Verifiable Performance Gap (0-25, quantitative)
 # ---------------------------------------------------------------------------
+
+def _peer_median(peers: list, attr: str) -> Optional[float]:
+    vals = [getattr(p, attr) for p in peers if getattr(p, attr) is not None]
+    return statistics.median(vals) if vals else None
+
 
 def _pct_gap(candidate: Optional[float], peer: Optional[float], lower_is_better: bool) -> Optional[float]:
     """Gap in the 'opportunity' direction, in fractional terms (0.03 = 300bps).
@@ -389,13 +433,13 @@ def compute_factor1_performance_gap(company: CompanyFinancials,
                                         "cannot verify a performance gap.")
 
     def peer_median(attr):
-        vals = [getattr(p, attr) for p in peers if getattr(p, attr) is not None]
-        return statistics.median(vals) if vals else None
+        return _peer_median(peers, attr)
 
     metrics = {
         "operating_ratio": (company.operating_ratio, peer_median("operating_ratio"), True),
         "ebitda_margin": (company.ebitda_margin, peer_median("ebitda_margin"), False),
         "roic_spread": (company.roic_spread, peer_median("roic_spread"), False),
+        "total_return_1yr": (company.total_return_1yr, peer_median("total_return_1yr"), False),
         "total_return_3yr": (company.total_return_3yr, peer_median("total_return_3yr"), False),
     }
 
@@ -442,9 +486,7 @@ def compute_factor1_performance_gap(company: CompanyFinancials,
 def compute_factor3_balance_sheet_slack(company: CompanyFinancials, peers: list) -> FactorScore:
     net_cash_ratio = company.net_cash_ratio
     leverage = company.net_debt_to_ebitda
-
-    peer_leverage_vals = [p.net_debt_to_ebitda for p in peers if p.net_debt_to_ebitda is not None]
-    peer_leverage_median = statistics.median(peer_leverage_vals) if peer_leverage_vals else None
+    peer_leverage_median = _peer_median(peers, "net_debt_to_ebitda")
 
     if net_cash_ratio is None and leverage is None:
         return FactorScore(0.0, 15.0, "Insufficient balance sheet data.")
@@ -474,6 +516,232 @@ def compute_factor3_balance_sheet_slack(company: CompanyFinancials, peers: list)
 
 
 # ---------------------------------------------------------------------------
+# Quantified growth potential -- deterministic dollar/percentage upside,
+# computed directly from financials (not LLM-estimated), so the "room for
+# growth" numbers in a report are exactly reproducible from the input data.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GrowthPotential:
+    ebitda_margin_gap_bps: Optional[float] = None
+    implied_ebitda_uplift: Optional[float] = None
+    implied_ev_upside_pct: Optional[float] = None
+    roic_spread_gap_bps: Optional[float] = None
+    implied_economic_profit_uplift: Optional[float] = None
+    balance_sheet_capacity: Optional[float] = None
+    rationale: str = ""
+
+
+def compute_growth_potential(company: CompanyFinancials, peers: list) -> GrowthPotential:
+    """Translates the peer gaps already used in Factor 1/3 into concrete
+    dollar (and %) upside figures:
+      - implied_ebitda_uplift: $ of EBITDA if margin matched the peer median
+      - implied_ev_upside_pct: % re-rating if that uplifted EBITDA were valued
+        at the peer group's own median EV/EBITDA multiple
+      - implied_economic_profit_uplift: $ of annual economic profit (ROIC
+        dollars above cost of capital) if the ROIC-vs-WACC spread matched peers
+      - balance_sheet_capacity: $ of incremental debt capacity vs. the peer
+        median leverage -- capital available for buybacks/dividends/M&A
+    Each figure is left None (not zero) when there isn't enough data or the
+    company already leads its peers on that metric -- absence means "no
+    quantifiable gap found," not "no upside.\""""
+    notes = []
+
+    peer_ebitda_margin = _peer_median(peers, "ebitda_margin")
+    ebitda_margin_gap_bps = None
+    implied_ebitda_uplift = None
+    if company.ebitda_margin is not None and peer_ebitda_margin is not None and company.revenue:
+        gap = peer_ebitda_margin - company.ebitda_margin
+        if gap > 0:
+            ebitda_margin_gap_bps = gap * 10_000
+            implied_ebitda_uplift = company.revenue * gap
+            notes.append(f"closing the {ebitda_margin_gap_bps:.0f}bps EBITDA margin gap to the peer "
+                         f"median implies ~{implied_ebitda_uplift:,.0f} of incremental annual EBITDA")
+
+    peer_ev_ebitda_vals = [p.enterprise_value / p.ebitda for p in peers
+                            if p.enterprise_value and p.ebitda]
+    peer_ev_ebitda_multiple = statistics.median(peer_ev_ebitda_vals) if peer_ev_ebitda_vals else None
+    implied_ev_upside_pct = None
+    if (implied_ebitda_uplift and peer_ev_ebitda_multiple and company.ebitda is not None
+            and company.enterprise_value):
+        new_ev = (company.ebitda + implied_ebitda_uplift) * peer_ev_ebitda_multiple
+        implied_ev_upside_pct = (new_ev - company.enterprise_value) / company.enterprise_value
+        notes.append(f"re-rated at the peer group's {peer_ev_ebitda_multiple:.1f}x EV/EBITDA multiple, "
+                     f"that implies ~{implied_ev_upside_pct * 100:.0f}% enterprise-value upside")
+
+    peer_roic_spread = _peer_median(peers, "roic_spread")
+    roic_spread_gap_bps = None
+    implied_economic_profit_uplift = None
+    if company.roic_spread is not None and peer_roic_spread is not None and company.market_cap:
+        gap = peer_roic_spread - company.roic_spread
+        if gap > 0:
+            roic_spread_gap_bps = gap * 10_000
+            invested_capital = (company.market_cap + (company.total_debt or 0.0)
+                                 - (company.cash_and_st_invest or 0.0))
+            if invested_capital > 0:
+                implied_economic_profit_uplift = invested_capital * gap
+                notes.append(f"closing the {roic_spread_gap_bps:.0f}bps ROIC-vs-cost-of-capital spread gap "
+                             f"implies ~{implied_economic_profit_uplift:,.0f} of incremental annual economic profit")
+
+    peer_leverage_median = _peer_median(peers, "net_debt_to_ebitda")
+    balance_sheet_capacity = None
+    if company.net_debt_to_ebitda is not None and peer_leverage_median is not None and company.ebitda:
+        underlevered_by = peer_leverage_median - company.net_debt_to_ebitda
+        if underlevered_by > 0:
+            balance_sheet_capacity = underlevered_by * company.ebitda
+            notes.append(f"~{balance_sheet_capacity:,.0f} of incremental debt capacity vs. the peer median "
+                         f"leverage, available for buybacks/dividends/M&A")
+
+    rationale = "; ".join(notes) if notes else \
+        "No quantifiable margin, ROIC, or leverage gap vs. peers -- no clear balance-sheet or " \
+        "margin-driven upside identified from financials alone."
+
+    return GrowthPotential(
+        ebitda_margin_gap_bps=ebitda_margin_gap_bps,
+        implied_ebitda_uplift=implied_ebitda_uplift,
+        implied_ev_upside_pct=implied_ev_upside_pct,
+        roic_spread_gap_bps=roic_spread_gap_bps,
+        implied_economic_profit_uplift=implied_economic_profit_uplift,
+        balance_sheet_capacity=balance_sheet_capacity,
+        rationale=rationale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Web-search-assisted research (server tool, no beta header required)
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
+
+
+def _extract_citations(content_blocks) -> list:
+    """Pull a deduplicated {title, url} list out of a response's content --
+    both from web_search_tool_result blocks (sources the model looked at)
+    and from inline citations on text blocks (sources it actually used)."""
+    seen = set()
+    citations = []
+
+    def add(title, url):
+        if url and url not in seen:
+            seen.add(url)
+            citations.append({"title": title or url, "url": url})
+
+    for block in content_blocks:
+        if block.type == "web_search_tool_result":
+            results = block.content if isinstance(block.content, list) else []
+            for result in results:
+                add(getattr(result, "title", None), getattr(result, "url", None))
+        elif block.type == "text" and getattr(block, "citations", None):
+            for citation in block.citations:
+                add(getattr(citation, "title", None), getattr(citation, "url", None))
+
+    return citations
+
+
+def _run_research_turn(system_prompt: str, user_content: str, anthropic_client, max_tokens=2048):
+    """Turn 1 of the two-turn pattern: open-ended generation with web_search
+    available (tool_choice left to its 'auto' default so Claude decides
+    whether/how much to search). Returns the raw response so its content can
+    be replayed verbatim into a follow-up turn that forces a structured tool."""
+
+    def do_call():
+        return anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            tools=[WEB_SEARCH_TOOL],
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+    return _retry(do_call, what="Claude web-search research turn")
+
+
+def _run_forced_tool_turn(prior_user_content, research_response, follow_up_instruction: str,
+                           tool_schema: dict, anthropic_client, max_tokens=1536):
+    """Turn 2: replay turn 1's exchange and force the structured tool call."""
+
+    def do_call():
+        return anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            tools=[tool_schema],
+            tool_choice={"type": "tool", "name": tool_schema["name"]},
+            messages=[
+                {"role": "user", "content": prior_user_content},
+                {"role": "assistant", "content": research_response.content},
+                {"role": "user", "content": follow_up_instruction},
+            ],
+        )
+
+    response = _retry(do_call, what=f"Claude forced tool call ({tool_schema['name']})")
+    for block in response.content:
+        if block.type == "tool_use" and block.name == tool_schema["name"]:
+            return block.input
+    raise RuntimeError(f"Claude did not return a tool_use block for {tool_schema['name']}")
+
+
+# ---------------------------------------------------------------------------
+# Peer discovery (web-search-assisted)
+# ---------------------------------------------------------------------------
+
+PEER_DISCOVERY_TOOL_SCHEMA = {
+    "name": "record_peer_candidates",
+    "description": "Record candidate direct-competitor tickers found via research.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "peers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ticker": {"type": "string", "description": "Stock ticker, e.g. 'UNP' or 'NYSE:UNP'."},
+                        "name": {"type": "string"},
+                        "rationale": {"type": "string", "description": "Why this is a genuinely comparable peer -- same sub-industry, similar business model/scale."},
+                    },
+                    "required": ["ticker", "name", "rationale"],
+                },
+                "description": "3-5 of the closest publicly traded direct competitors. Empty array if none can be identified with confidence.",
+            },
+        },
+        "required": ["peers"],
+    },
+}
+
+PEER_DISCOVERY_SYSTEM_PROMPT = """You are researching direct, publicly traded competitors for a company \
+being evaluated as an activist-investment candidate. The methodology requires benchmarking against a \
+"near-identical peer" -- a company running a genuinely comparable business (same sub-industry, similar \
+scale/geography/business model), not just the same broad sector. Use web search to find current, \
+real, publicly traded competitors and their stock tickers. Do not invent tickers -- if you cannot verify \
+one with reasonable confidence, leave it out. Prefer 2-4 highly comparable peers over a longer list of \
+loose ones."""
+
+
+def discover_peer_tickers(company: CompanyFinancials, anthropic_client=None) -> list:
+    """Use web search to find real, ticker-identified direct competitors for
+    `company`. Returns a list of {ticker, name, rationale} dicts (possibly
+    empty). Callers are expected to fetch fundamentals for any new tickers
+    and fold them into the peer group used for Factor 1/3."""
+    if anthropic_client is None:
+        import anthropic
+        anthropic_client = anthropic.Anthropic()
+
+    user_content = (
+        f"Company: {company.name or company.ticker} (ticker: {company.ticker})\n"
+        f"Sub-industry: {company.gics_sub_industry_name or 'unknown'}\n"
+        f"Revenue: {company.revenue}\n\n"
+        "Search the web to find its 3-5 closest publicly traded direct competitors and their tickers."
+    )
+    research = _run_research_turn(PEER_DISCOVERY_SYSTEM_PROMPT, user_content, anthropic_client)
+    result = _run_forced_tool_turn(
+        user_content, research,
+        "Now record the peer candidates you found using the record_peer_candidates tool.",
+        PEER_DISCOVERY_TOOL_SCHEMA, anthropic_client,
+    )
+    return result.get("peers", [])
+
+
+# ---------------------------------------------------------------------------
 # Factors 2, 4, 5 - LLM-assisted qualitative scoring
 # ---------------------------------------------------------------------------
 
@@ -489,6 +757,20 @@ QUALITATIVE_TOOL_SCHEMA = {
                                 "the fix, e.g. 'X trades at a 900bps EBITDA margin discount to Y despite "
                                 "an identical route network, and a spinoff of its logistics unit -- already "
                                 "separately valued by the market -- would close most of that gap.'"
+            },
+            "business_overview": {
+                "type": "string",
+                "description": "3-5 sentences: what the company actually does, how its business model "
+                                "makes money, and how it's positioned vs. its peers/market -- written so "
+                                "the specific inefficiency the thesis targets is legible from the description."
+            },
+            "management_assessment": {
+                "type": "string",
+                "description": "CEO/executive tenure and track record, recent leadership or board changes, "
+                                "insider buying/selling, and capital allocation decisions -- specifically "
+                                "calling out where management appears to be running the business inefficiently "
+                                "or where a change in leadership/discipline would unlock value. Say plainly if "
+                                "the current team looks well-regarded and effective instead."
             },
             "factor2_score": {"type": "number", "description": "0-25. Credible, executable fix."},
             "factor2_rationale": {"type": "string"},
@@ -508,16 +790,26 @@ QUALITATIVE_TOOL_SCHEMA = {
                 "description": "List of specific red flags identified, matching the methodology's red-flag categories."
             },
         },
-        "required": ["one_sentence_thesis", "factor2_score", "factor2_rationale", "factor4_score",
+        "required": ["one_sentence_thesis", "business_overview", "management_assessment",
+                     "factor2_score", "factor2_rationale", "factor4_score",
                      "factor4_rationale", "factor5_score", "factor5_rationale", "red_flags"],
     },
 }
 
 QUALITATIVE_SYSTEM_PROMPT = """You are scoring a company as a potential activist-investment candidate \
-using a fixed five-factor rubric derived from 19 historic activist campaigns. You will score only \
-Factors 2, 4 and 5. Be skeptical and evidence-based: if you don't have enough information to justify a \
-high score, score low and say so in the rationale. Do not invent named executives or events -- if you \
-are not confident one exists, leave the relevant field empty and score conservatively.
+using a fixed five-factor rubric derived from 19 historic activist campaigns. You have a web_search tool \
+-- use it to ground your scoring in current, real information: recent news, management changes, insider \
+transactions, governance events, and how the stock has traded relative to its peers. You will score only \
+Factors 2, 4 and 5 (Factors 1 and 3 were already computed from financial data and are given to you as \
+context). Be skeptical and evidence-based: if you don't have enough information to justify a high score, \
+score low and say so in the rationale. Do not invent named executives or events -- if you are not confident \
+one exists, leave the relevant field empty and score conservatively.
+
+Management is the most important qualitative signal in activist investing. Specifically research and assess:
+who runs the company and for how long, whether there have been recent executive or board departures/additions,
+insider buying or selling, and whether recent capital allocation decisions (M&A, buybacks, capex, spinoffs)
+look disciplined or wasteful. Your business_overview and management_assessment should together make clear
+*where the operational or governance inefficiency is* -- that's what a real activist thesis is built on.
 
 Factor 2 - Credible, Executable Fix (0-25):
   25 pts: a named operator with a proven track record of the exact fix elsewhere, OR an already-separable,
@@ -540,20 +832,19 @@ Factor 5 - Structural Feasibility / Absence of Red Flags (0-15, start at 15 and 
 You will also write `one_sentence_thesis`: the entire activist case in one sentence, naming the
 specific quantified gap and the specific fix. If the data doesn't support a strong thesis, say so
 plainly in that sentence rather than overstating it (e.g. "No clean peer gap or executable fix
-identified; not currently an activist candidate.").
-
-Call the record_qualitative_scores tool exactly once with your scores."""
+identified; not currently an activist candidate.")."""
 
 
-def llm_score_qualitative_factors(company: CompanyFinancials,
-                                    factor1: FactorScore,
-                                    factor3: FactorScore,
-                                    research_notes: str = "",
-                                    anthropic_client=None) -> dict:
-    """Draft Factors 2, 4, 5 via Claude. `research_notes` should carry any
-    news/filings context you have (recent headlines, CEO tenure, ownership
-    structure, segment structure) -- the model will not browse the web on
-    its own. Returns a dict matching QUALITATIVE_TOOL_SCHEMA's properties."""
+def research_and_score_qualitative(company: CompanyFinancials,
+                                     factor1: FactorScore,
+                                     factor3: FactorScore,
+                                     research_notes: str = "",
+                                     anthropic_client=None) -> tuple:
+    """Two-turn web-search-assisted scoring of Factors 2, 4, 5: an open-ended
+    research turn with web_search enabled, followed by a forced tool call
+    that extracts the structured score. Returns (qual_dict, citations) where
+    citations is a deduplicated [{title, url}, ...] list gathered from the
+    research turn."""
     if anthropic_client is None:
         import anthropic
         anthropic_client = anthropic.Anthropic()
@@ -567,6 +858,8 @@ def llm_score_qualitative_factors(company: CompanyFinancials,
         "market_cap": company.market_cap,
         "net_cash_ratio": company.net_cash_ratio,
         "roic_spread": company.roic_spread,
+        "total_return_1yr": company.total_return_1yr,
+        "total_return_3yr": company.total_return_3yr,
         "factor1_quant_score": factor1.score,
         "factor1_rationale": factor1.rationale,
         "factor3_quant_score": factor3.score,
@@ -575,28 +868,22 @@ def llm_score_qualitative_factors(company: CompanyFinancials,
 
     user_content = (
         f"Company financial summary:\n{json.dumps(company_summary, indent=2, default=str)}\n\n"
-        f"Research notes (news, governance, ownership, segment structure -- may be empty):\n"
-        f"{research_notes or '(none provided)'}\n\n"
-        "Score Factors 2, 4 and 5 for this company."
+        f"Research notes you've been given (may be empty):\n{research_notes or '(none provided)'}\n\n"
+        "Research this company: what its business does, recent news, management tenure and changes, "
+        "insider activity, capital allocation track record, and how its stock has traded relative to peers "
+        "over the last year. Then assess it against Factors 2, 4 and 5 of the rubric."
     )
 
-    def do_call():
-        return anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=1024,
-            system=QUALITATIVE_SYSTEM_PROMPT,
-            tools=[QUALITATIVE_TOOL_SCHEMA],
-            tool_choice={"type": "tool", "name": "record_qualitative_scores"},
-            messages=[{"role": "user", "content": user_content}],
-        )
+    research = _run_research_turn(QUALITATIVE_SYSTEM_PROMPT, user_content, anthropic_client, max_tokens=3072)
+    citations = _extract_citations(research.content)
 
-    response = _retry(do_call, what=f"Claude qualitative scoring for {company.ticker}")
-
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_qualitative_scores":
-            return block.input
-
-    raise RuntimeError(f"Claude did not return a tool_use block for {company.ticker}")
+    qual = _run_forced_tool_turn(
+        user_content, research,
+        "Now record your scores, thesis, business overview, and management assessment using the "
+        "record_qualitative_scores tool.",
+        QUALITATIVE_TOOL_SCHEMA, anthropic_client, max_tokens=1536,
+    )
+    return qual, citations
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +896,10 @@ def score_company(company: CompanyFinancials,
                     anthropic_client=None) -> ActivistScore:
     factor1 = compute_factor1_performance_gap(company, peers)
     factor3 = compute_factor3_balance_sheet_slack(company, peers)
+    growth_potential = compute_growth_potential(company, peers)
 
-    qual = llm_score_qualitative_factors(company, factor1, factor3, research_notes, anthropic_client)
+    qual, citations = research_and_score_qualitative(company, factor1, factor3, research_notes, anthropic_client)
+    logo_url = fetch_logo_url(company.name or company.ticker)
 
     factor2 = FactorScore(
         score=max(0.0, min(25.0, float(qual["factor2_score"]))),
@@ -637,6 +926,11 @@ def score_company(company: CompanyFinancials,
         factor4=factor4,
         factor5=factor5,
         thesis=qual.get("one_sentence_thesis", ""),
+        business_overview=qual.get("business_overview", ""),
+        management_assessment=qual.get("management_assessment", ""),
+        logo_url=logo_url,
+        citations=citations,
+        growth_potential=growth_potential,
         qualitative_notes={
             "named_operator_or_asset": qual.get("named_operator_or_asset", ""),
             "catalyst_evidence": qual.get("catalyst_evidence", ""),

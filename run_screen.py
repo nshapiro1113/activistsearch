@@ -9,9 +9,11 @@ Usage:
     python run_screen.py --mock AAPL MSFT CP CNI          # no CIQ/Anthropic creds needed
     python run_screen.py --tickers-file tickers.csv --notes-file notes.json --non-interactive TICKER1,TICKER2
 
-Peer groups are drawn from *within* the tickers you supply (grouped by GICS
-sub-industry) -- so include the peers you want a candidate benchmarked
-against in the same run. This tool does not do its own peer discovery.
+Peer groups are drawn first from *within* the tickers you supply (grouped by
+GICS sub-industry); for any candidate with fewer than 2 in-list peers, Claude
+is asked to find real, ticker-identified direct competitors via web search,
+and their fundamentals are pulled in automatically to fill out the peer group
+used for Factor 1/3.
 """
 
 from __future__ import annotations
@@ -23,12 +25,54 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import anthropic
+
 from scorer import (
     CapitalIQClient,
     MockCapitalIQClient,
+    discover_peer_tickers,
     score_company,
 )
 from playbook import generate_playbook, save_playbook
+
+MIN_PEERS_BEFORE_DISCOVERY = 2
+
+
+def _normalize_ticker(raw: str) -> str:
+    """Strip an 'EXCHANGE:TICKER' prefix if present, e.g. 'NYSE:UNP' -> 'UNP'."""
+    return raw.split(":")[-1].strip().upper()
+
+
+def augment_peers_via_web_search(financials_by_ticker: dict, peer_groups: dict,
+                                   ciq_client, anthropic_client) -> None:
+    """Mutates financials_by_ticker and peer_groups in place: for any company
+    with too few in-list peers, discovers real competitors via web search and
+    pulls in their fundamentals."""
+    for ticker, company in list(financials_by_ticker.items()):
+        if len(peer_groups.get(ticker, [])) >= MIN_PEERS_BEFORE_DISCOVERY:
+            continue
+        print(f"  {ticker}: only {len(peer_groups.get(ticker, []))} in-list peer(s) -- "
+              f"searching the web for direct competitors...")
+        try:
+            candidates = discover_peer_tickers(company, anthropic_client=anthropic_client)
+        except Exception as exc:
+            print(f"    WARNING: peer discovery failed for {ticker}: {exc}", file=sys.stderr)
+            continue
+
+        for candidate in candidates:
+            peer_ticker = _normalize_ticker(candidate.get("ticker", ""))
+            if not peer_ticker or peer_ticker == ticker:
+                continue
+            if peer_ticker not in financials_by_ticker:
+                try:
+                    financials_by_ticker[peer_ticker] = ciq_client.get_fundamentals(peer_ticker)
+                except Exception as exc:
+                    print(f"    WARNING: could not fetch discovered peer {peer_ticker}: {exc}", file=sys.stderr)
+                    continue
+            peer_company = financials_by_ticker[peer_ticker]
+            if peer_company not in peer_groups[ticker]:
+                peer_groups[ticker].append(peer_company)
+                print(f"    + added {peer_ticker} ({candidate.get('rationale', '')[:80]})")
 
 
 def read_tickers_file(path: str) -> list:
@@ -135,6 +179,7 @@ def main():
     research_notes = load_research_notes(args.notes_file)
 
     ciq_client = MockCapitalIQClient() if args.mock else CapitalIQClient()
+    anthropic_client = anthropic.Anthropic()
 
     print(f"Fetching fundamentals for {len(tickers)} ticker(s)...")
     financials_by_ticker = {}
@@ -150,14 +195,21 @@ def main():
 
     peer_groups = build_peer_groups(financials_by_ticker)
 
+    print("Checking peer coverage (finding direct competitors via web search where needed)...")
+    augment_peers_via_web_search(financials_by_ticker, peer_groups, ciq_client, anthropic_client)
+
     print("Scoring candidates (Factors 1 & 3 computed, Factors 2/4/5 drafted by Claude)...")
     scores = {}
-    for ticker, company in financials_by_ticker.items():
+    for ticker in tickers:
+        if ticker not in financials_by_ticker:
+            continue
+        company = financials_by_ticker[ticker]
         try:
             scores[ticker] = score_company(
                 company,
                 peer_groups[ticker],
                 research_notes=research_notes.get(ticker, ""),
+                anthropic_client=anthropic_client,
             )
         except Exception as exc:
             print(f"  WARNING: failed to score {ticker}, skipping: {exc}", file=sys.stderr)
@@ -192,7 +244,8 @@ def main():
         peers = peer_groups[ticker]
         try:
             markdown_text = generate_playbook(
-                score, company, peers, research_notes=research_notes.get(ticker, "")
+                score, company, peers, research_notes=research_notes.get(ticker, ""),
+                anthropic_client=anthropic_client,
             )
             path = save_playbook(ticker, markdown_text, output_dir=args.reports_dir)
             print(f"  {ticker}: wrote {path}")
