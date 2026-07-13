@@ -3,9 +3,9 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -d ".venv" ]; then
+if [ ! -d ".venv.nosync" ]; then
   echo "Setting up (first run only)..."
-  python3 -m venv .venv
+  python3 -m venv .venv.nosync
 fi
 
 if [ -f ".env" ]; then
@@ -14,6 +14,6 @@ if [ -f ".env" ]; then
   set +a
 fi
 
-source .venv/bin/activate
+source .venv.nosync/bin/activate
 pip install -q -r requirements.txt
 streamlit run app.py

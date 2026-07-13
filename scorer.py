@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import pandas as pd
 import requests
 
 logger = logging.getLogger("activistsearch.scorer")
@@ -342,6 +343,185 @@ def _to_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT")
+
+# XBRL us-gaap tags to try, in priority order, for each field. Different
+# filers use different tags for economically-equivalent line items.
+XBRL_TAGS = {
+    "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+    "operating_income": ["OperatingIncomeLoss"],
+    "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "depreciation_amortization": ["DepreciationDepletionAndAmortization",
+                                    "DepreciationAmortizationAndAccretionNet", "DepreciationAndAmortization"],
+    "interest_expense": ["InterestExpense", "InterestExpenseDebt", "InterestExpenseNet"],
+    "cash_and_st_invest": ["CashAndCashEquivalentsAtCarryingValue",
+                             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "short_term_investments": ["ShortTermInvestments"],
+    "long_term_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "current_debt": ["LongTermDebtCurrent", "DebtCurrent"],
+}
+
+
+class FreeDataClient:
+    """Fundamentals from free, keyless sources instead of Capital IQ:
+    SEC EDGAR's XBRL company-facts API for financial-statement data, and
+    Yahoo Finance (via yfinance) for market data (price, market cap, beta,
+    total return).
+
+    Known gaps vs. Capital IQ (use MockCapitalIQClient or CapitalIQClient if
+    these matter for your use case):
+      - Only covers SEC filers (US-listed/reporting companies).
+      - EBITDA is derived (operating income + D&A from the two most recent
+        10-K tags found, not necessarily the same fiscal period) rather than
+        vendor-computed -- treat as approximate.
+      - No official GICS sub-industry (that taxonomy is S&P/MSCI-licensed).
+        SEC's SIC code/description is used as a coarser peer-grouping
+        substitute.
+      - Set SEC_USER_AGENT (e.g. "YourApp your@email.com") in .env -- SEC
+        requires a descriptive contact string on every request and may block
+        the default placeholder.
+    """
+
+    _cik_map: Optional[dict] = None
+
+    def __init__(self):
+        if not SEC_USER_AGENT:
+            raise RuntimeError(
+                "Set SEC_USER_AGENT (e.g. 'YourApp your@email.com') before using FreeDataClient -- "
+                "SEC EDGAR requires a descriptive contact string on every request and returns "
+                "403 Forbidden without one."
+            )
+        self._session = requests.Session()
+        self._session.headers["User-Agent"] = SEC_USER_AGENT
+
+    def _load_cik_map(self) -> dict:
+        if FreeDataClient._cik_map is None:
+            def do_call():
+                resp = self._session.get("https://www.sec.gov/files/company_tickers.json", timeout=15)
+                resp.raise_for_status()
+                return resp.json()
+            data = _retry(do_call, what="SEC ticker->CIK map")
+            FreeDataClient._cik_map = {
+                row["ticker"].upper(): (row["cik_str"], row["title"]) for row in data.values()
+            }
+        return FreeDataClient._cik_map
+
+    def _company_facts(self, cik: int) -> dict:
+        def do_call():
+            resp = self._session.get(
+                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json", timeout=20)
+            resp.raise_for_status()
+            return resp.json()
+        return _retry(do_call, what=f"SEC companyfacts for CIK{cik:010d}")
+
+    def _submission(self, cik: int) -> dict:
+        def do_call():
+            resp = self._session.get(
+                f"https://data.sec.gov/submissions/CIK{cik:010d}.json", timeout=20)
+            resp.raise_for_status()
+            return resp.json()
+        return _retry(do_call, what=f"SEC submission for CIK{cik:010d}")
+
+    @staticmethod
+    def _latest_annual(facts: dict, tags: list) -> Optional[float]:
+        """Most recent full-year value across all fallback tags for this field
+        (not just the first tag that has any data -- companies switch tags
+        over time, e.g. Apple moved off 'Revenues' after FY2018, so comparing
+        recency only within a single tag can silently return a stale value)."""
+        us_gaap = facts.get("facts", {}).get("us-gaap", {})
+        all_entries = [e for tag in tags
+                       for e in us_gaap.get(tag, {}).get("units", {}).get("USD", [])
+                       if e.get("form", "").startswith("10-K") and e.get("val") is not None]
+        # Prefer full-year entries (fp == "FY"); a 10-K can also carry tagged
+        # quarterly comparatives with later filing dates but earlier period ends.
+        annual = [e for e in all_entries if e.get("fp") == "FY"] or all_entries
+        if not annual:
+            return None
+        return float(max(annual, key=lambda e: e.get("end", ""))["val"])
+
+    def _yahoo_market_data(self, ticker: str) -> dict:
+        import yfinance as yf
+
+        def do_call():
+            t = yf.Ticker(ticker)
+            info = t.get_info()
+            hist = t.history(period="3y", auto_adjust=True)
+            return info, hist
+        info, hist = _retry(do_call, what=f"Yahoo Finance data for {ticker}")
+
+        def _return_over(days: int) -> Optional[float]:
+            if hist.empty:
+                return None
+            closes = hist["Close"]
+            end = closes.iloc[-1]
+            cutoff = closes.index[-1] - pd.Timedelta(days=days)
+            past = closes[closes.index <= cutoff]
+            if past.empty:
+                return None
+            start = past.iloc[-1]
+            return float(end / start - 1) if start else None
+
+        return {
+            "market_cap": info.get("marketCap"),
+            "beta": info.get("beta"),
+            "total_return_1yr": _return_over(365),
+            "total_return_3yr": _return_over(3 * 365),
+            "name": info.get("longName") or info.get("shortName"),
+        }
+
+    def get_fundamentals(self, ticker: str) -> CompanyFinancials:
+        cik_map = self._load_cik_map()
+        entry = cik_map.get(ticker.upper())
+        if entry is None:
+            raise ValueError(f"{ticker} not found in SEC's ticker list (not a US SEC filer?)")
+        cik, sec_name = entry
+
+        facts = self._company_facts(cik)
+        submission = self._submission(cik)
+        market = self._yahoo_market_data(ticker)
+
+        operating_income = self._latest_annual(facts, XBRL_TAGS["operating_income"])
+        d_and_a = self._latest_annual(facts, XBRL_TAGS["depreciation_amortization"])
+        ebitda = operating_income + d_and_a if operating_income is not None and d_and_a is not None \
+            else operating_income
+        revenue = self._latest_annual(facts, XBRL_TAGS["revenue"])
+        ebitda_margin = ebitda / revenue if ebitda is not None and revenue else None
+
+        cash = self._latest_annual(facts, XBRL_TAGS["cash_and_st_invest"])
+        short_term_invest = self._latest_annual(facts, XBRL_TAGS["short_term_investments"])
+        cash_and_st_invest = (cash or 0.0) + (short_term_invest or 0.0) if (cash or short_term_invest) else None
+
+        long_term_debt = self._latest_annual(facts, XBRL_TAGS["long_term_debt"])
+        current_debt = self._latest_annual(facts, XBRL_TAGS["current_debt"])
+        total_debt = (long_term_debt or 0.0) + (current_debt or 0.0) if (long_term_debt or current_debt) else None
+
+        market_cap = market["market_cap"]
+        enterprise_value = (market_cap + (total_debt or 0.0) - (cash_and_st_invest or 0.0)
+                             if market_cap is not None else None)
+
+        return CompanyFinancials(
+            ticker=ticker.upper(),
+            name=market["name"] or sec_name,
+            revenue=revenue,
+            ebitda=ebitda,
+            ebitda_margin=ebitda_margin,
+            operating_income=operating_income,
+            net_income=self._latest_annual(facts, XBRL_TAGS["net_income"]),
+            total_debt=total_debt,
+            cash_and_st_invest=cash_and_st_invest,
+            market_cap=market_cap,
+            enterprise_value=enterprise_value,
+            beta=market["beta"],
+            interest_expense=self._latest_annual(facts, XBRL_TAGS["interest_expense"]),
+            total_return_1yr=market["total_return_1yr"],
+            total_return_3yr=market["total_return_3yr"],
+            gics_sub_industry=submission.get("sic"),
+            gics_sub_industry_name=submission.get("sicDescription"),
+            raw={"cik": cik, "sic": submission.get("sic")},
+        )
 
 
 class MockCapitalIQClient:
@@ -674,6 +854,11 @@ def _run_forced_tool_turn(prior_user_content, research_response, follow_up_instr
         )
 
     response = _retry(do_call, what=f"Claude forced tool call ({tool_schema['name']})")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"Claude's {tool_schema['name']} tool call was cut off at the {max_tokens}-token limit "
+            "before finishing -- raise max_tokens for this call rather than trust the partial output."
+        )
     for block in response.content:
         if block.type == "tool_use" and block.name == tool_schema["name"]:
             return block.input
@@ -881,7 +1066,7 @@ def research_and_score_qualitative(company: CompanyFinancials,
         user_content, research,
         "Now record your scores, thesis, business overview, and management assessment using the "
         "record_qualitative_scores tool.",
-        QUALITATIVE_TOOL_SCHEMA, anthropic_client, max_tokens=1536,
+        QUALITATIVE_TOOL_SCHEMA, anthropic_client, max_tokens=4096,
     )
     return qual, citations
 

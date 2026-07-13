@@ -29,6 +29,7 @@ import anthropic
 
 from scorer import (
     CapitalIQClient,
+    FreeDataClient,
     MockCapitalIQClient,
     discover_peer_tickers,
     score_company,
@@ -158,9 +159,14 @@ def main():
     parser.add_argument("--tickers-file", help="CSV/text file with one ticker per line.")
     parser.add_argument("--notes-file", help="JSON file mapping ticker -> research notes string, "
                                               "fed to the LLM scoring and playbook steps.")
-    parser.add_argument("--mock", action="store_true",
-                         help="Use synthetic financial data instead of live Capital IQ "
-                              "(still calls the real Anthropic API unless ANTHROPIC_API_KEY is unset).")
+    data_source = parser.add_mutually_exclusive_group()
+    data_source.add_argument("--mock", action="store_true",
+                              help="Use synthetic financial data instead of live Capital IQ "
+                                   "(still calls the real Anthropic API unless ANTHROPIC_API_KEY is unset).")
+    data_source.add_argument("--free-data", action="store_true",
+                              help="Use free fundamentals from SEC EDGAR (XBRL filings) + Yahoo Finance "
+                                   "instead of Capital IQ. No credentials needed, but only covers US SEC "
+                                   "filers and uses SIC codes instead of GICS for peer grouping.")
     parser.add_argument("--output-csv", default="scores.csv", help="Where to write the ranked score table.")
     parser.add_argument("--reports-dir", default="reports", help="Directory for generated playbooks.")
     parser.add_argument("--non-interactive", metavar="TICKER1,TICKER2",
@@ -178,7 +184,12 @@ def main():
 
     research_notes = load_research_notes(args.notes_file)
 
-    ciq_client = MockCapitalIQClient() if args.mock else CapitalIQClient()
+    if args.mock:
+        ciq_client = MockCapitalIQClient()
+    elif args.free_data:
+        ciq_client = FreeDataClient()
+    else:
+        ciq_client = CapitalIQClient()
     anthropic_client = anthropic.Anthropic()
 
     print(f"Fetching fundamentals for {len(tickers)} ticker(s)...")

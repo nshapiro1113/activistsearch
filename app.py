@@ -17,7 +17,7 @@ import statistics
 import pandas as pd
 import streamlit as st
 
-from scorer import CapitalIQClient, MockCapitalIQClient, score_company
+from scorer import CapitalIQClient, FreeDataClient, MockCapitalIQClient, score_company
 from playbook import generate_playbook
 from run_screen import augment_peers_via_web_search, build_peer_groups
 
@@ -32,21 +32,27 @@ if "scores" not in st.session_state:
 if "playbooks" not in st.session_state:
     st.session_state.playbooks = {}
 
-st.title("Activist Investment Candidate Screener")
+st.title("`activistsearch`")
+st.caption("Ned Shapiro")
 st.caption("Score candidates against the 5-factor methodology, then generate a full playbook for the ones worth a closer look.")
 
 with st.sidebar:
     st.header("Data source")
-    use_mock = st.toggle(
-        "Use mock financial data",
-        value=not bool(os.environ.get("CIQ_USERNAME")),
-        help="No Capital IQ credentials needed. Turn this off once you have real CIQ credentials.",
+    data_source = st.segmented_control(
+        "Financial data source",
+        ["Free (SEC + Yahoo)", "Capital IQ", "Mock"],
+        default="Capital IQ" if os.environ.get("CIQ_USERNAME") else "Free (SEC + Yahoo)",
+        label_visibility="collapsed",
     )
 
     ciq_username = ciq_password = None
-    if not use_mock:
+    if data_source == "Capital IQ":
         ciq_username = st.text_input("CIQ username", value=os.environ.get("CIQ_USERNAME", ""))
         ciq_password = st.text_input("CIQ password", value=os.environ.get("CIQ_PASSWORD", ""), type="password")
+    elif data_source == "Free (SEC + Yahoo)":
+        st.caption("SEC EDGAR (XBRL filings) + Yahoo Finance. No credentials needed, but only covers "
+                   "US SEC filers, derives EBITDA rather than using a vendor figure, and groups peers "
+                   "by SIC code instead of GICS sub-industry.")
 
     st.header("Claude API")
     anthropic_key = st.text_input(
@@ -74,10 +80,12 @@ def get_anthropic_client():
 
 
 def get_ciq_client():
-    if use_mock:
+    if data_source == "Mock":
         return MockCapitalIQClient()
+    if data_source == "Free (SEC + Yahoo)":
+        return FreeDataClient()
     if not ciq_username or not ciq_password:
-        st.error("Enter your Capital IQ username and password in the sidebar, or turn on mock data.")
+        st.error("Enter your Capital IQ username and password in the sidebar, or switch data source.")
         st.stop()
     return CapitalIQClient(username=ciq_username, password=ciq_password)
 
@@ -178,6 +186,12 @@ if st.session_state.scores:
     def _pct(value):
         return f"{value * 100:.1f}%" if value is not None else "n/a"
 
+    show_overview_and_management = st.toggle(
+        "Show company overview & management assessment", value=True,
+        help="Turn off to keep each candidate's expander compact -- factor scores, peer metrics, "
+             "and growth potential stay visible either way.",
+    )
+
     st.markdown("### Opportunity detail (for each candidate)")
     for s in ranked:
         company = st.session_state.financials_by_ticker.get(s.ticker)
@@ -222,12 +236,13 @@ if st.session_state.scores:
                 growth_cols[3].metric("Balance-sheet capacity", _money(gp.balance_sheet_capacity))
                 st.caption(gp.rationale)
 
-            if s.business_overview:
-                st.markdown("**Company overview**")
-                st.write(s.business_overview)
-            if s.management_assessment:
-                st.markdown("**Management assessment**")
-                st.write(s.management_assessment)
+            if show_overview_and_management:
+                if s.business_overview:
+                    st.markdown("**Company overview**")
+                    st.write(s.business_overview)
+                if s.management_assessment:
+                    st.markdown("**Management assessment**")
+                    st.write(s.management_assessment)
 
             st.markdown("**Factor scores**")
             for label, factor in [

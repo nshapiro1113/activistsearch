@@ -2,3 +2,4 @@ requests>=2.31
 anthropic>=0.40
 streamlit>=1.38
 pandas>=2.0
+yfinance>=0.2.40
