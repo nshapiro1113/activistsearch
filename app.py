@@ -32,8 +32,8 @@ if "scores" not in st.session_state:
 if "playbooks" not in st.session_state:
     st.session_state.playbooks = {}
 
-st.title("`activistsearch`")
-st.caption("Ned Shapiro")
+st.title(":green[activistsearch]")
+st.caption(":green[Ned Shapiro]")
 st.caption("Score candidates against the 5-factor methodology, then generate a full playbook for the ones worth a closer look.")
 
 with st.sidebar:

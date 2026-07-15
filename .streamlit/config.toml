@@ -2,11 +2,11 @@
 base = "dark"
 backgroundColor = "#0a0f0a"
 secondaryBackgroundColor = "#101a10"
-textColor = "#39ff6a"
+textColor = "#ffffff"
 primaryColor = "#1f9d55"
 linkColor = "#7dffb0"
 borderColor = "#1f3a24"
-codeTextColor = "#39ff6a"
+codeTextColor = "#ffffff"
 codeBackgroundColor = "#101a10"
 greenColor = "#39ff6a"
 
@@ -20,6 +20,6 @@ showSidebarBorder = true
 [theme.sidebar]
 backgroundColor = "#050805"
 secondaryBackgroundColor = "#101a10"
-textColor = "#39ff6a"
+textColor = "#ffffff"
 borderColor = "#1f3a24"
 primaryColor = "#1f9d55"
