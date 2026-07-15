@@ -61,7 +61,17 @@ def augment_peers_via_web_search(financials_by_ticker: dict, peer_groups: dict,
             continue
 
         for candidate in candidates:
-            peer_ticker = _normalize_ticker(candidate.get("ticker", ""))
+            # Claude's forced tool call is supposed to return {ticker, name,
+            # rationale} objects per PEER_DISCOVERY_TOOL_SCHEMA, but tool
+            # schemas aren't strictly guaranteed -- it can occasionally
+            # return a bare ticker string instead. Handle both shapes.
+            if isinstance(candidate, dict):
+                raw_ticker = candidate.get("ticker", "")
+                rationale = candidate.get("rationale", "")
+            else:
+                raw_ticker = str(candidate)
+                rationale = ""
+            peer_ticker = _normalize_ticker(raw_ticker)
             if not peer_ticker or peer_ticker == ticker:
                 continue
             if peer_ticker not in financials_by_ticker:
@@ -73,7 +83,7 @@ def augment_peers_via_web_search(financials_by_ticker: dict, peer_groups: dict,
             peer_company = financials_by_ticker[peer_ticker]
             if peer_company not in peer_groups[ticker]:
                 peer_groups[ticker].append(peer_company)
-                print(f"    + added {peer_ticker} ({candidate.get('rationale', '')[:80]})")
+                print(f"    + added {peer_ticker} ({rationale[:80]})")
 
 
 def read_tickers_file(path: str) -> list:
